@@ -1,0 +1,52 @@
+# Anakin API for Snowflake — Native App manifest
+#
+# Schema confirmed against:
+#   - docs.snowflake.com/en/developer-guide/native-apps/native-apps-about
+#   - docs.snowflake.com/en/developer-guide/native-apps/manifest-reference
+#   - docs.snowflake.com/en/developer-guide/native-apps/requesting-refs
+#   - docs.snowflake.com/en/developer-guide/native-apps/requesting-example-oauth
+# (see ../../SUBMIT.md for exactly what was verbatim-confirmed vs. inferred)
+#
+# manifest_version, artifacts, and artifacts.setup_script are the required
+# fields. This app additionally uses `references` — the mechanism a Native
+# App uses to ask the consumer to bind a real object (here: an External
+# Access Integration and a Secret) after installation, since the app cannot
+# create either on its own (they name real network/credential resources
+# that only the consumer's account can authorize).
+
+manifest_version: 1
+
+artifacts:
+  readme: README.md
+  setup_script: scripts/setup.sql
+
+# Every procedure in core.* needs both of these bound before it will run.
+# See README.md's "Setup" section for the exact consumer-side SQL
+# (CREATE NETWORK RULE / CREATE SECRET / CREATE EXTERNAL ACCESS INTEGRATION /
+# CALL config.register_single_reference) that binds them.
+references:
+  - anakin_api_access:
+      label: "Anakin API access"
+      description: >-
+        External Access Integration allowing this app to make outbound
+        HTTPS calls to api.anakin.io (Anakin's public REST API). Required
+        by every procedure in the core schema.
+      privileges:
+        - USAGE
+      object_type: EXTERNAL ACCESS INTEGRATION
+      register_callback: config.register_single_reference
+      configuration_callback: config.get_config_for_ref
+      required_at_setup: true
+
+  - anakin_api_key_secret:
+      label: "Anakin API key"
+      description: >-
+        Your Anakin API key, sent as the X-API-Key header on every request.
+        Get a free key (300 credits, no card required) at
+        https://anakin.io/dashboard.
+      privileges:
+        - READ
+      object_type: SECRET
+      register_callback: config.register_single_reference
+      configuration_callback: config.get_config_for_ref
+      required_at_setup: true

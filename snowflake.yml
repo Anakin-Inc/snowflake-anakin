@@ -1,0 +1,30 @@
+# Snowflake CLI project definition (`snow app run` / `snow app deploy`).
+# Schema confirmed against
+# docs.snowflake.com/en/developer-guide/snowflake-cli/native-apps/project-definitions
+# (definition_version: 2, entities map, "application package" + "application"
+# entity types, artifacts src/dest mapping). Never run against a real
+# Snowflake CLI install in this sandbox — see SUBMIT.md.
+
+definition_version: 2
+
+entities:
+  pkg:
+    type: application package
+    identifier: anakin_api_pkg
+    stage: app_src.stage
+    manifest: app/manifest.yml
+    artifacts:
+      - src: app/*
+        dest: ./
+    meta:
+      role: anakin_app_provider_role
+      warehouse: anakin_app_build_wh
+
+  app:
+    type: application
+    identifier: anakin_api
+    from:
+      target: pkg
+    meta:
+      role: anakin_app_provider_role
+      warehouse: anakin_app_build_wh

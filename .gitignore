@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+target/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+*.egg-info/
+.pytest_cache/
+.coverage
+*.class
+.env
+!.env.example
