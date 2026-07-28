@@ -16,12 +16,30 @@ glossed over.
 ```
 snowflake.yml              Snowflake CLI project definition (snow app run / snow app deploy)
 app/manifest.yml            Native App manifest — artifacts + references (EAI + secret)
-app/scripts/setup.sql        Setup script: 2 reference callbacks + 7 Snowpark Python procedures
+app/scripts/setup.sql        Setup script: 2 reference callbacks + 31 Snowpark Python procedures
 app/python/anakin_procs.py    Same handler logic, standalone + py_compile-checked
 app/README.md                 In-app README shown to consumers in Snowsight
 README.md                    This submission's top-level overview (dagster-anakin's convention)
 SUBMIT.md                    This file
 ```
+
+**Coverage update (this pass):** the initial build wrapped 3 of Anakin's 21
+REST API operations (url-scraper, search, agentic-search). This pass adds
+15 more — map, crawl, the 5 Wire operations (wire_discover, wire_catalog,
+wire_read_action, wire_write_action, wire_identities), the 2 AI Visibility
+operations, the 2 browser-session operations, and the 4 website-monitoring
+operations — bringing coverage to 18 of 21. Ground truth for these 15 is
+Anakin's own MCP server source, `anakin-mcp/src/client.ts` (exact request
+bodies, query params, poll-terminal-status logic) and the matching files
+under `anakin-mcp/src/tools/*.ts` (parameter names/defaults/behavior notes
+as exposed to callers) — read directly, not guessed. Still not wrapped:
+`ai/evaluate` (browser_task — an AI-driven browser automation endpoint with
+its own longer poll window and a different accepted-job shape,
+`workflow_id` not `jobId`/`job_id`), `wire/login` (interactive credential
+sign-in), and `wire/build-request` (generates a new catalog action) — all
+three are real, documented endpoints in client.ts, scoped out of this pass
+by the task's own capability list, not overlooked. `app/scripts/setup.sql`
+and `app/python/anakin_procs.py` both flag this explicitly at the top.
 
 ## Real Native App structure confirmed — not assumed
 
@@ -158,10 +176,36 @@ than defaulting to anakin-py's much longer 300s `poll_timeout`.
 anakin-py's `client.py` docstring ("Synchronous — returns directly, no
 polling") and implemented as a single `POST /search` call.
 
+**The same reasoning was applied consistently to all 15 endpoints added
+afterwards.** map, crawl, wire_read_action, wire_write_action, and
+ai_visibility_search are async on Anakin's side (each returns a `jobId` /
+`job_id` / `search_id` to poll), so each got a submit_*/check_* pair plus a
+bounded *_sync convenience, exactly like url-scraper and agentic-search.
+wire_discover, wire_catalog, wire_identities, ai_visibility_sources,
+session_list, session_delete, monitor_create, monitor_list,
+monitor_changes, and monitor_control are synchronous on Anakin's side (no
+job/poll cycle exists in the real API for any of them, confirmed from
+`anakin-mcp/src/client.ts` — e.g. `monitorCreate()` calls `request('POST',
+'/monitors', body)` once and returns; there is no `/monitors/:id/status` to
+poll), so each got exactly one procedure, matching `core.anakin_search`'s
+precedent rather than inventing a poll cycle the API doesn't have.
+
+Two behavioral details worth flagging explicitly because they differ from
+the fixed-backoff poll loop used everywhere else in this file:
+`core.wire_read_action_sync` / `core.wire_write_action_sync` honor the
+Wire job's server-suggested `retry_after_ms` pacing hint (clamped to
+[500ms, 10s]) instead of a fixed 1.5x backoff, matching client.ts's
+`pollWireJob()` exactly; and `core.ai_visibility_search_sync` treats any
+status other than `"running"` as terminal (so a `"failed"` result is
+returned, not raised, since the payload still carries per-source
+results/errors the caller needs) instead of checking for named
+`completed`/`failed` values, matching client.ts's `aiVisibilitySearch()`
+exactly.
+
 ## Ground truth for the Anakin API — read from source, not guessed
 
-All three wrapped operations and their exact request/response field names
-(`jobId`, camelCase body fields like `useBrowser`/`generateJson`/
+The original 3 wrapped operations and their exact request/response field
+names (`jobId`, camelCase body fields like `useBrowser`/`generateJson`/
 `forceFresh`, the `status` terminal values `completed`/`failed`) were read
 directly from `anakin-py/src/anakin/client.py`, `models.py`, and `_http.py`
 — the real SDK built earlier this session — not inferred from this
@@ -187,31 +231,99 @@ submission's own guesses:
   `dagster-anakin/README.md` and several other earlier submissions this
   session used before that correction was found.
 
+The 15 operations added afterwards were read directly from **anakin-mcp's
+own source** — `anakin-mcp/src/client.ts` (the `AnakinClient` class: every
+request body field, query param, and poll-terminal-status check) and the
+matching files under `anakin-mcp/src/tools/*.ts` (parameter names/defaults/
+behavior notes as exposed to MCP callers, useful for confirming intent
+alongside the wire format) — Anakin's own MCP server, a second independent
+real codebase, not this submission's guesses:
+
+- `POST /map` (submit) + `GET /map/:jobId` (poll) — body fields and
+  defaults (`limit: 100`, `depth: 2`, `limitPerLevel: 100`,
+  `includeSubdomains: false`, `includeExternalLinks: false`, `useBrowser:
+  false`, optional `search`) match `AnakinClient.map()` exactly.
+- `POST /crawl` (submit) + `GET /crawl/:jobId` (poll) — body fields and
+  defaults (`maxPages: 10`, `depth: 1`, `country: "us"`, `useBrowser:
+  false`, optional `includePatterns`/`excludePatterns`/`sessionId`/
+  `sessionName`) match `AnakinClient.crawl()` exactly.
+- `GET /wire/resolve?q=&limit=` — matches `wireResolve()`.
+- `GET /wire/catalog` or `GET /wire/catalog/:slug` — matches
+  `wireCatalog()`.
+- `POST /wire/task` (submit, `{action_id, params?, credential_id?,
+  identity_id?}`) + `GET /wire/jobs/:jobId` (poll) — matches `wireRun()` /
+  `pollWireJob()` exactly, including the `job_id` (not `jobId`) accepted-
+  job field name per the `WireTaskAccepted` type, and the
+  `retry_after_ms` pacing hint honored by `pollWireJob()`. Split into
+  `core.submit_wire_read_action` / `core.submit_wire_write_action` (sharing
+  one `core.check_wire_job`) to mirror anakin-mcp's own `wire_read_action`
+  / `wire_write_action` tool split — the same underlying endpoint, split
+  client-side as a safety convention (tools/wire.ts explicitly documents
+  this: "This separation is mandatory for the Connectors Directory, which
+  rejects a single catch-all tool that mixes safe (read) and unsafe
+  (write) operations").
+- `GET /wire/identities?catalog_id=` — matches `wireIdentities()`.
+- `POST /ai-visibility/search` (submit) + `GET
+  /ai-visibility/search/:search_id` (poll) — matches
+  `aiVisibilitySearch()` exactly, including its non-standard terminal
+  condition (`status !== 'running'`, not a named completed/failed pair).
+- `GET /ai-visibility/sources` — matches `aiVisibilitySources()`.
+- `GET /sessions?domain=` — matches `sessionsList()`.
+- `DELETE /sessions/:id` — matches `sessionDelete()`.
+- `POST /monitors`, `GET /monitors[/:id]`, `GET /monitors/:id/changes`,
+  `POST /monitors/:id/pause|resume|run`, `DELETE /monitors/:id` — match
+  `monitorCreate()`/`monitorList()`/`monitorGet()`/`monitorChanges()`/
+  `monitorControl()` exactly, including the `run_now` action mapping to
+  `POST .../run` (not `.../run_now` — a naming mismatch in the real API
+  that would have been an easy, silent bug to introduce by guessing
+  instead of reading `monitorControl()`'s switch statement directly).
+- Not wrapped: `POST /ai/evaluate` + `GET /ai/jobs/:id` (`browser_task` —
+  its own accepted-job field is `workflow_id`, not `jobId`/`job_id`, and
+  its poll window is 6 minutes vs. everything else's 3), `POST /wire/login`
+  (interactive credential sign-in), and `POST /wire/build-request` (builds
+  a brand-new catalog action). All three are real, documented in
+  `client.ts`, and excluded because they were outside the task's stated
+  capability list for this pass, not because anything about them was
+  unclear.
+
 ## Verified, not assumed — file mechanics
 
-- `python3 -m py_compile app/python/anakin_procs.py` — passes.
-- Every one of the **8 inline Python handler blocks embedded in
+- `python3 -m py_compile app/python/anakin_procs.py` — passes (all 33
+  module-level functions across the original 3 operations and the 15
+  added afterwards).
+- Every one of the **32 inline Python handler blocks embedded in
   `app/scripts/setup.sql`** (the `config.get_config_for_ref` callback plus
-  all 7 `core.*` procedures) was individually extracted and run through
-  `py_compile` in isolation — **all 8 pass**. This matters because
+  all 31 `core.*` procedures) was individually extracted and run through
+  `py_compile` in isolation — **all 32 pass**. This matters because
   `setup.sql`'s handlers are hand-copied from `anakin_procs.py` (see that
   file's docstring for why — real doc ambiguity on the `IMPORTS`+`AS`
   clause requirement, see below), so each copy needed its own independent
-  syntax check rather than trusting they matched.
+  syntax check rather than trusting they matched. Verified programmatically
+  (extract every `AS\n$$\n...\n$$;` block via regex, `py_compile` each in
+  isolation), not by eye.
 - `app/manifest.yml` and `snowflake.yml` both parse cleanly with PyYAML
   (`yaml.safe_load`), confirmed structurally: `manifest.yml` has the 3
   required top-level keys (`manifest_version`, `artifacts`, `references`)
   and both `references` entries carry `object_type`, `register_callback`,
-  `configuration_callback` as expected; `snowflake.yml` has
+  `configuration_callback` as expected — unchanged by this pass, since
+  every new procedure reuses the same two references (`anakin_api_access`,
+  `anakin_api_key_secret`), no new EAI/secret needed; `snowflake.yml` has
   `definition_version: 2` and both `pkg`/`app` entities.
-- `setup.sql`'s `$$ ... $$` handler-body delimiters are balanced: 9
+- `setup.sql`'s `$$ ... $$` handler-body delimiters are balanced: 33
   `CREATE PROCEDURE ... AS $$ ... $$;` bodies (the SQL `register_single_
-  reference` callback + the Python `get_config_for_ref` callback + the 7
-  `core.*` procedures) = 18 delimiters, plus one `--` comment line that
-  mentions `$$ ... $$` in prose (2 more, inert inside a SQL comment) = 20
+  reference` callback + the Python `get_config_for_ref` callback + 31
+  `core.*` procedures) = 66 delimiters, plus one `--` comment line that
+  mentions `$$ ... $$` in prose (2 more, inert inside a SQL comment) = 68
   total, an even count — verified programmatically by counting, not by eye
-  — and parenthesis depth outside those blocks returns to zero, i.e. no
-  unclosed `CREATE PROCEDURE(...)` argument lists.
+  — and parenthesis depth across the whole file balances (691 open, 691
+  close), i.e. no unclosed `CREATE PROCEDURE(...)` argument lists anywhere
+  in the file, old or new.
+- All 33 `COMMENT = '...'` string literals in `setup.sql` were checked for
+  correctly-escaped internal apostrophes (`''`) by counting `COMMENT = '`
+  occurrences against a regex that only matches a *properly terminated*
+  quoted string — counts matched (31; two procedures have no `COMMENT`
+  clause), so no unescaped apostrophe silently breaks a string literal
+  into invalid SQL.
 - No tabs in either YAML file (YAML requires spaces for indentation).
 
 ## Genuinely uncertain — flagged, not hidden
@@ -257,13 +369,27 @@ submission's own guesses:
   the Snowflake CLI.** There is no `snow` CLI installed and no Snowflake
   account credentials available in this sandbox. `snow app run`, `snow app
   deploy`, `CREATE APPLICATION PACKAGE`, installing the app, granting the
-  external access integration, and calling any of the 7 procedures against
-  the live Anakin API were **never attempted** — this is expected and
-  stated directly, not a gap being minimized. Everything marked
-  "Verified" above is syntax-level (Python compiles, YAML parses,
+  external access integration, and calling any of the 31 `core.*`
+  procedures against the live Anakin API were **never attempted** — this
+  is expected and stated directly, not a gap being minimized. Everything
+  marked "Verified" above is syntax-level (Python compiles, YAML parses,
   delimiters balance) or research-level (matches Snowflake's own
-  documentation and cross-corroborated third-party examples); nothing here
+  documentation and cross-corroborated third-party examples, or matches
+  anakin-mcp's own source for the 15 newer procedures); nothing here
   constitutes proof the app actually installs or runs.
+- **No financial-transaction guard on `core.submit_wire_write_action` /
+  `core.wire_write_action_sync`.** anakin-mcp's own `tools/wire.ts` +
+  `tools/policy.ts` refuse write actions that look like a payment/fund
+  transfer (checkout, buy now, wire transfer, etc.) as a defense-in-depth
+  measure required by Anthropic's Connectors Directory policy for MCP
+  connectors. This Snowflake submission's write-action procedures are, by
+  design, thin unmodified passthroughs to `POST /wire/task` — like every
+  other procedure in this file — with no equivalent guard, and Snowflake
+  Marketplace's own review criteria (a different product surface, not the
+  Connectors Directory) were not researched to know whether an equivalent
+  restriction is expected there. Flagged here rather than silently
+  ported or silently omitted — a real decision for whoever reviews this
+  before it's actually submitted.
 - **Provider Studio listing itself was not attempted.** Publishing this
   as a Snowflake Marketplace listing needs a Snowflake **Provider**
   account (a real, separate onboarding step from a regular consumer
@@ -306,8 +432,8 @@ submission's own guesses:
    this sandbox has no path to.
 2. Install the Snowflake CLI, run `snow app run` from this directory to
    create a dev application package + application, and actually exercise
-   the 7 procedures against live Anakin credentials — the one verification
-   step this session structurally could not do.
+   all 31 `core.*` procedures against live Anakin credentials — the one
+   verification step this session structurally could not do.
 3. Resolve the two "genuinely uncertain" `SYSTEM$REFERENCE`/`CREATE SECRET`
    syntax points above against real Snowflake CLI error messages (or
    Snowflake's own quickstart/sample-app GitHub repos, not fetched this
